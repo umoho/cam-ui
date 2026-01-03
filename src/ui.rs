@@ -1,19 +1,29 @@
 use eframe::egui;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::sync::mpsc;
+
+use crate::video::record::{Container, RecordCommand, RecordSettings, Resolution, VideoEncoder};
 
 pub struct CameraApp {
     frame_buffer: Arc<Mutex<Option<egui::ColorImage>>>,
     texture: Option<egui::TextureHandle>,
+    rec_cmd_tx: mpsc::UnboundedSender<RecordCommand>,
+    is_recording: bool,
     iso: u32,
     shutter: String,
 }
 
 impl CameraApp {
-    pub fn new(frame_buffer: Arc<Mutex<Option<egui::ColorImage>>>) -> Self {
+    pub fn new(
+        frame_buffer: Arc<Mutex<Option<egui::ColorImage>>>,
+        rec_cmd_tx: mpsc::UnboundedSender<RecordCommand>,
+    ) -> Self {
         Self {
             frame_buffer,
             texture: None,
+            rec_cmd_tx,
+            is_recording: false,
             iso: 800,
             shutter: "1/500".to_string(),
         }
@@ -22,6 +32,34 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- 1. 处理录制快捷键 (R 键) ---
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            if self.is_recording {
+                // 停止录制
+                let _ = self.rec_cmd_tx.send(RecordCommand::Stop);
+                self.is_recording = false;
+            } else {
+                // 开始录制：配置默认参数
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                let settings = RecordSettings {
+                    res: Resolution {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    enc: VideoEncoder::H264,
+                    container: Container::MOV,
+                    filepath: format!("rec_{}.mov", timestamp).into(),
+                };
+
+                let _ = self.rec_cmd_tx.send(RecordCommand::Start(settings));
+                self.is_recording = true;
+            }
+        }
+
         // 1. 获取最新图像并转换为 GPU 纹理
         if let Some(image) = self.frame_buffer.lock().take() {
             self.texture = Some(ctx.load_texture("cam_frame", image, Default::default()));

@@ -5,22 +5,42 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
-pub fn spawn_gst_thread(buffer: Arc<Mutex<Option<egui::ColorImage>>>) {
+pub(crate) mod record;
+
+pub fn spawn_gst_thread(
+    buffer: Arc<Mutex<Option<egui::ColorImage>>>,
+    mut rec_cmd_rx: mpsc::UnboundedReceiver<record::RecordCommand>,
+) {
     std::thread::spawn(move || {
         // 采集 RGBA 原始像素，适配 egui
-        // let pipeline_str = "videotestsrc ! video/x-raw,format=RGBA,width=1280,height=720 ! appsink name=sink sync=false";
-        let pipeline_str = "videotestsrc ! video/x-raw,width=1280,height=720 ! videoconvert ! cairooverlay name=overlay ! videoconvert ! appsink name=sink sync=false";
-        // let pipeline_str = "srtsrc uri=\"srt://:7000?mode=listener\" ! tsdemux ! queue ! h264parse ! avdec_h264 ! videoconvert ! videoscale ! video/x-raw,format=RGBA,width=1280,height=720 ! appsink name=sink sync=false";
-        let pipeline = gst::parse::launch(pipeline_str).expect("Pipeline error");
+        let pipeline_str = r#"
+            videotestsrc name=src !
+            video/x-raw !
+            videoconvert !
+            tee name=t
+
+            t. ! queue name=q_prev !
+            videoscale !
+            video/x-raw,width=1280,height=720 !
+            cairooverlay name=overlay !
+            videoconvert !
+            video/x-raw,format=RGBA !
+            appsink name=sink sync=false
+            "#;
+        let pipeline = gst::parse::launch(pipeline_str)
+            .expect("Pipeline error")
+            .dynamic_cast::<gst::Pipeline>()
+            .unwrap();
+
+        let tee = pipeline.by_name("t").unwrap();
+
         let sink = pipeline
-            .downcast_ref::<gst::Bin>()
-            .unwrap()
             .by_name("sink")
             .unwrap()
             .dynamic_cast::<gst_app::AppSink>()
             .expect("Sink error");
-
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
@@ -54,8 +74,52 @@ pub fn spawn_gst_thread(buffer: Arc<Mutex<Option<egui::ColorImage>>>) {
         overlay.connect("draw", false, draw_overlay);
 
         pipeline.set_state(gst::State::Playing).ok();
+
+        let mut current_recording: Option<record::ActiveRecording> = None;
         let bus = pipeline.bus().unwrap();
-        for _msg in bus.iter_timed(gst::ClockTime::NONE) {}
+
+        loop {
+            // 1. 处理来自 UI 的指令 (非阻塞)
+            while let Ok(cmd) = rec_cmd_rx.try_recv() {
+                match cmd {
+                    record::RecordCommand::Start(settings) => {
+                        if current_recording.is_none() {
+                            match record::start_recording(&pipeline, &tee, settings) {
+                                Ok(active) => current_recording = Some(active),
+                                Err(e) => eprintln!("Start Rec Error: {}", e),
+                            }
+                        }
+                    }
+                    record::RecordCommand::Stop => {
+                        if let Some(active) = current_recording.take() {
+                            // 这里调用之前定义的 stop_recording
+                            record::stop_recording(&pipeline, &tee, active);
+                        }
+                    }
+                }
+            }
+
+            // 2. 处理总线消息 (带超时的轮询，防止 CPU 占用 100%)
+            if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(10)) {
+                use gst::MessageView;
+                match msg.view() {
+                    MessageView::Error(err) => {
+                        eprintln!("Pipeline Error: {}", err.error());
+                        break; // 发生错误退出循环
+                    }
+                    MessageView::Eos(_) => break, // 收到结束信号退出
+                    _ => (),
+                }
+            }
+
+            // NOTE: 如果需要极高性能，可以移除 sleep
+            // 但在带有指令轮询的循环中，适当的微小延迟是有益的
+        }
+        // 3. 退出前的清理 (防止程序崩溃导致文件损坏)
+        if let Some(active) = current_recording.take() {
+            record::stop_recording(&pipeline, &tee, active);
+        }
+        let _ = pipeline.set_state(gst::State::Null);
     });
 }
 

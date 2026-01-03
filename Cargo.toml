@@ -1,0 +1,12 @@
+[package]
+name = "cam-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.33.3"
+egui_extras = "0.33.3"
+gstreamer = { version = "0.24.4", features = ["v1_18"] }
+gstreamer-app = "0.24.4"
+gstreamer-video = "0.24.4"
+parking_lot = "0.12.5"

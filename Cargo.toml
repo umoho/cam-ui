@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cairo-rs = { version = "0.21.5", features = ["use_glib"] }
 eframe = "0.33.3"
 egui_extras = "0.33.3"
 gstreamer = { version = "0.24.4", features = ["v1_18"] }

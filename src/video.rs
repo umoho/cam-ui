@@ -11,6 +11,7 @@ pub(crate) mod record;
 
 pub fn spawn_gst_thread(
     buffer: Arc<Mutex<Option<egui::ColorImage>>>,
+    audio_level: Arc<Mutex<f32>>,
     mut rec_cmd_rx: mpsc::UnboundedReceiver<record::RecordCommand>,
 ) {
     std::thread::spawn(move || {
@@ -30,13 +31,14 @@ pub fn spawn_gst_thread(
             appsink name=sink sync=false
 
 
-            audiotestsrc is-live=true !
+            osxaudiosrc !
             audioconvert !
             audioresample !
             tee name=t_a
 
             t_a. ! queue !
-            appsink name=sink_a sync=false
+            level name=audio_meter interval=50000000 !
+            fakesink
             "#;
         let pipeline = gst::parse::launch(pipeline_str)
             .expect("Pipeline error")
@@ -120,6 +122,25 @@ pub fn spawn_gst_thread(
                         break; // 发生错误退出循环
                     }
                     MessageView::Eos(_) => break, // 收到结束信号退出
+
+                    // 处理音频电平消息
+                    MessageView::Element(ext)
+                        // 确认消息来源是我们管线中命名的 "audio_meter"
+                        if ext
+                            .src()
+                            .map(|s| s.name() == "audio_meter")
+                            .unwrap_or(false) =>
+                    {
+                        if let Some(structure) = ext.structure() {
+                            if let Ok(rms_array) = structure.get::<gst::glib::ValueArray>("rms") {
+                                if let Some(val_value) = rms_array.get(0) {
+                                    if let Ok(db) = val_value.get::<f64>() {
+                                        *audio_level.lock() = db as f32;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     _ => (),
                 }
             }

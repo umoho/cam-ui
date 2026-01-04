@@ -15,12 +15,15 @@ fn main() -> eframe::Result {
     // 2. 创建共享图像缓冲区 (RGBA)
     let frame_buffer = Arc::new(Mutex::new(None));
 
+    // 音频电平，通常为 [-60, 0]
+    let audio_level = Arc::new(Mutex::new(-60.0f32));
+
     // 3. 创建录制指令通道
     // 使用 unbounded_channel 因为指令频率低，且不希望 UI 线程被阻塞
     let (rec_cmd_tx, rec_cmd_rx) = mpsc::unbounded_channel();
 
     // 4. 启动视频采集线程
-    video::spawn_gst_thread(frame_buffer.clone(), rec_cmd_rx);
+    video::spawn_gst_thread(frame_buffer.clone(), audio_level.clone(), rec_cmd_rx);
 
     // 5. 运行 egui
     let options = eframe::NativeOptions {
@@ -36,7 +39,11 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             // 启用内建的 SVG 支持
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(ui::CameraApp::new(frame_buffer, rec_cmd_tx)))
+            Ok(Box::new(ui::CameraApp::new(
+                frame_buffer,
+                audio_level,
+                rec_cmd_tx,
+            )))
         }),
     )
 }

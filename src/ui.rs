@@ -12,11 +12,13 @@ pub struct CameraApp {
     is_recording: bool,
     iso: u32,
     shutter: String,
+    audio_level: Arc<Mutex<f32>>,
 }
 
 impl CameraApp {
     pub fn new(
         frame_buffer: Arc<Mutex<Option<egui::ColorImage>>>,
+        audio_level: Arc<Mutex<f32>>,
         rec_cmd_tx: mpsc::UnboundedSender<RecordCommand>,
     ) -> Self {
         Self {
@@ -26,6 +28,7 @@ impl CameraApp {
             is_recording: false,
             iso: 800,
             shutter: "1/500".to_string(),
+            audio_level,
         }
     }
 }
@@ -59,6 +62,9 @@ impl eframe::App for CameraApp {
                 self.is_recording = true;
             }
         }
+
+        // 获取当前音频电平
+        let current_level = *self.audio_level.lock();
 
         // 1. 获取最新图像并转换为 GPU 纹理
         if let Some(image) = self.frame_buffer.lock().take() {
@@ -123,6 +129,19 @@ impl eframe::App for CameraApp {
                         param_widget(ui, "SHUTTER", &self.shutter);
                     });
                 });
+
+                // 绘制电平数值文字
+                ui.painter().text(
+                    rect.right_top() + egui::vec2(-100.0, 50.0),
+                    egui::Align2::RIGHT_TOP,
+                    format!("Audio Volumn: {:.3}", current_level), // 显示三位小数
+                    egui::FontId::proportional(20.0),
+                    if current_level > 0.9 {
+                        egui::Color32::RED
+                    } else {
+                        egui::Color32::GREEN
+                    },
+                );
             });
 
         // 关键：请求下一帧重绘（实现实时视频）

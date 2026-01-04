@@ -38,13 +38,15 @@ pub(crate) struct RecordSettings {
 /// 内部结构, 用于记住当前正在录制的组件, 以便后续释放.
 pub(super) struct ActiveRecording {
     bin: gst::Element,
-    tee_pad: gst::Pad,
+    video_tee_pad: gst::Pad,
+    audio_tee_pad: gst::Pad,
 }
 
 /// 可能的错误: [BoolError], [PadLinkError].
 pub(super) fn start_recording(
     pipeline: &gst::Pipeline,
-    tee: &gst::Element,
+    video_tee: &gst::Element,
+    audio_tee: &gst::Element,
     settings: RecordSettings,
 ) -> Result<ActiveRecording, Box<dyn std::error::Error + Send + Sync>> {
     // 1. 根据配置映射插件名称
@@ -62,83 +64,115 @@ pub(super) fn start_recording(
     // 流程：队列缓冲 -> 格式转换 -> 缩放尺寸 -> 编码 -> 封装 -> 写入文件
     // NOTE: format=I420 修复 QuickTime Player 打不开 MP4 的问题
     let bin_desc = format!(
-        "queue ! videoconvert ! videoscale ! \
-            video/x-raw,width={w},height={h},format=I420 ! \
-            {enc} ! {mux} ! filesink location={path}",
+        "bin.(
+            queue name=q_v !
+            videoconvert !
+            videoscale !
+            video/x-raw,width={w},height={h},format=I420 !
+            {enc_v} !
+            mux.video_0
+
+            queue name=q_a !
+            audioconvert !
+            audioresample !
+            fdkaacenc !
+            aacparse !
+            mux.audio_0
+
+            {mux} name=mux !
+            filesink location={path}
+        )",
         w = settings.res.width,
         h = settings.res.height,
-        enc = enc_plugin,
+        enc_v = enc_plugin,
         mux = mux_plugin,
         path = path_str
     );
-
-    // 3. 将字符串转为 Element (Bin)
-    let bin = gst::parse::bin_from_description(&bin_desc, true)?;
-    // 4. 将新创建的 Bin 添加进运行中的 Pipeline
+    let bin = gst::parse::bin_from_description(&bin_desc, false)?;
     pipeline.add(&bin)?;
-    // 5. 从 Tee 申请一个动态出口 Pad (Request Pad)
-    // "src_%u" 是 tee 的命名模板，GStreamer 会自动分配 src_0, src_1 等
-    let tee_src_pad = tee
-        .request_pad_simple("src_%u")
-        .expect("Failed to request pad from tee");
-    // 6. 获取 Bin 的入口 Pad (通常是刚才 queue 的 sink pad)
-    let bin_sink_pad = bin
-        .static_pad("sink")
-        .expect("Failed to get sink pad from recording bin");
-    // 7. 物理链接
-    tee_src_pad.link(&bin_sink_pad)?;
-    // 8. 启动该分支的状态 (同步到父管线的 Playing 状态)
+
+    // 添加 Ghost Pads
+    let v_inner_sink = bin.by_name("q_v").unwrap().static_pad("sink").unwrap();
+    let v_ghost_pad = gst::GhostPad::builder_with_target(&v_inner_sink)?
+        .name("v_sink")
+        .build();
+    v_ghost_pad.set_active(true)?;
+    bin.add_pad(&v_ghost_pad)?;
+
+    let a_inner_sink = bin.by_name("q_a").unwrap().static_pad("sink").unwrap();
+    let a_ghost_pad = gst::GhostPad::builder_with_target(&a_inner_sink)?
+        .name("a_sink")
+        .build();
+    a_ghost_pad.set_active(true)?;
+    bin.add_pad(&a_ghost_pad)?;
+
+    let video_tee_pad = video_tee.request_pad_simple("src_%u").unwrap();
+    video_tee_pad.link(&v_ghost_pad)?;
+
+    let audio_tee_pad = audio_tee.request_pad_simple("src_%u").unwrap();
+    audio_tee_pad.link(&a_ghost_pad)?;
+
+    // 启动该分支的状态 (同步到父管线的 Playing 状态)
     bin.sync_state_with_parent()?;
 
     Ok(ActiveRecording {
         bin: bin.into(),
-        tee_pad: tee_src_pad,
+        video_tee_pad,
+        audio_tee_pad,
     })
 }
 
 pub(super) fn stop_recording(
     pipeline: &gst::Pipeline,
-    tee: &gst::Element,
+    video_tee: &gst::Element,
+    audio_tee: &gst::Element,
     active: ActiveRecording,
 ) {
-    let pipeline = pipeline.clone();
-    let tee = tee.clone();
-    let bin = active.bin.clone();
-    let tee_pad = active.tee_pad.clone();
+    // GStreamer 对象（Element, Pad等）内部是引用计数，克隆代价很小
+    let pipeline_c = pipeline.clone();
+    let bin_el = active.bin.clone();
+    let v_tee_src = active.video_tee_pad.clone();
+    let a_tee_src = active.audio_tee_pad.clone();
+    let vt_clone = video_tee.clone();
+    let at_clone = audio_tee.clone();
 
-    // 1. 在 tee 的出口 pad 上添加一个 IDLE 探针
-    // IDLE 探针会在该线路上没有数据流动（空闲）时触发回调
-    tee_pad.add_probe(gst::PadProbeType::IDLE, move |pad, _info| {
-        println!("Tee pad is idle, starting safe teardown...");
+    v_tee_src
+        .clone()
+        .add_probe(gst::PadProbeType::IDLE, move |v_src, _info| {
+            println!("Tee pad is idle, starting safe teardown...");
 
-        // 2. 立即断开链接，防止录制分支的状态变化反向阻塞 tee
-        // 我们需要获取 bin 的 sink pad 来执行 unlink
-        if let Some(bin_sink_pad) = bin.static_pad("sink") {
-            let _ = pad.unlink(&bin_sink_pad);
-        }
+            let bin = bin_el.clone().dynamic_cast::<gst::Bin>().unwrap();
 
-        // 3. 向录制分支发送 EOS，确保文件正确关闭
-        bin.send_event(gst::event::Eos::new());
+            let v_ghost_pad = bin.static_pad("v_sink").unwrap();
+            let a_ghost_pad = bin.static_pad("a_sink").unwrap();
 
-        // 4. 由于我们在探针回调内（属于流线程），不能直接在这里做繁重的清理
-        // 建议在一个新线程中完成最后的 Null 切换和移除，或者稍后在主循环处理
-        let bin_inner = bin.clone();
-        let tee_inner = tee.clone();
-        let pad_inner = pad.clone();
-        let pipeline_inner = pipeline.clone();
+            // 断开视频和音频
+            let _ = v_src.unlink(&v_ghost_pad);
+            let _ = a_tee_src.unlink(&a_ghost_pad);
 
-        std::thread::spawn(move || {
-            // 给 EOS 一点时间流过编码器
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            // 发送 EOS
+            bin.send_event(gst::event::Eos::new());
 
-            bin_inner.set_state(gst::State::Null).ok();
-            tee_inner.release_request_pad(&pad_inner);
-            pipeline_inner.remove(&bin_inner).ok();
+            // 为后台清理线程准备克隆
+            let bin_for_cleanup = bin_el.clone();
+            let tv_for_cleanup = vt_clone.clone();
+            let ta_for_cleanup = at_clone.clone();
+            let vp_for_cleanup = v_tee_src.clone();
+            let ap_for_cleanup = a_tee_src.clone();
+            let pipe_for_cleanup = pipeline_c.clone();
 
-            println!("Recording stopped and file finalized.");
+            std::thread::spawn(move || {
+                // 给编码器排空数据的时间
+                std::thread::sleep(std::time::Duration::from_millis(600));
+
+                bin_for_cleanup.set_state(gst::State::Null).ok();
+                tv_for_cleanup.release_request_pad(&vp_for_cleanup);
+                ta_for_cleanup.release_request_pad(&ap_for_cleanup);
+                pipe_for_cleanup.remove(&bin_for_cleanup).ok();
+
+                println!("AV Recording Stopped and cleaned up.");
+            });
+
+            gst::PadProbeReturn::Remove
         });
-
-        // 5. 返回 Remove 意味着探针执行一次后自动移除
-        gst::PadProbeReturn::Remove
-    });
 }

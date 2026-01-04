@@ -16,25 +16,35 @@ pub fn spawn_gst_thread(
     std::thread::spawn(move || {
         // 采集 RGBA 原始像素，适配 egui
         let pipeline_str = r#"
-            videotestsrc name=src !
+            videotestsrc name=src is-live=true !
             video/x-raw !
             videoconvert !
-            tee name=t
+            tee name=t_v
 
-            t. ! queue name=q_prev !
+            t_v. ! queue name=q_prev !
             videoscale !
             video/x-raw,width=1280,height=720 !
             cairooverlay name=overlay !
             videoconvert !
             video/x-raw,format=RGBA !
             appsink name=sink sync=false
+
+
+            audiotestsrc is-live=true !
+            audioconvert !
+            audioresample !
+            tee name=t_a
+
+            t_a. ! queue !
+            appsink name=sink_a sync=false
             "#;
         let pipeline = gst::parse::launch(pipeline_str)
             .expect("Pipeline error")
             .dynamic_cast::<gst::Pipeline>()
             .unwrap();
 
-        let tee = pipeline.by_name("t").unwrap();
+        let video_tee = pipeline.by_name("t_v").unwrap();
+        let audio_tee = pipeline.by_name("t_a").unwrap();
 
         let sink = pipeline
             .by_name("sink")
@@ -84,7 +94,9 @@ pub fn spawn_gst_thread(
                 match cmd {
                     record::RecordCommand::Start(settings) => {
                         if current_recording.is_none() {
-                            match record::start_recording(&pipeline, &tee, settings) {
+                            match record::start_recording(
+                                &pipeline, &video_tee, &audio_tee, settings,
+                            ) {
                                 Ok(active) => current_recording = Some(active),
                                 Err(e) => eprintln!("Start Rec Error: {}", e),
                             }
@@ -93,7 +105,7 @@ pub fn spawn_gst_thread(
                     record::RecordCommand::Stop => {
                         if let Some(active) = current_recording.take() {
                             // 这里调用之前定义的 stop_recording
-                            record::stop_recording(&pipeline, &tee, active);
+                            record::stop_recording(&pipeline, &video_tee, &audio_tee, active);
                         }
                     }
                 }
@@ -117,7 +129,7 @@ pub fn spawn_gst_thread(
         }
         // 3. 退出前的清理 (防止程序崩溃导致文件损坏)
         if let Some(active) = current_recording.take() {
-            record::stop_recording(&pipeline, &tee, active);
+            record::stop_recording(&pipeline, &video_tee, &audio_tee, active);
         }
         let _ = pipeline.set_state(gst::State::Null);
     });
